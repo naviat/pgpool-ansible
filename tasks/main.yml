@@ -1,0 +1,6 @@
+---
+- name: "Enable SSH connection between hosts"
+  import_tasks: ssh.yml
+
+- name: "Install pgpool"
+  import_tasks: install.yml

@@ -1,0 +1,76 @@
+#!/bin/bash
+# This script is executed by "recovery_1st_stage" to recovery a Standby node.
+
+set -o xtrace
+exec > >(logger -i -p local1.info) 2>&1
+
+PRIMARY_NODE_PGDATA="$1"
+DEST_NODE_HOST="$2"
+DEST_NODE_PGDATA="$3"
+PRIMARY_NODE_PORT="$4"
+DEST_NODE_PORT=5432
+
+PGHOME={{ postgresql_exec_dir }}
+ARCHIVEDIR={{ postgresql_archive_dir }}
+REPL_USER={{ postgresql_streaming_user.name }}
+
+logger -i -p local1.info recovery_1st_stage: start: pg_basebackup for Standby node PostgreSQL@{$DEST_NODE_HOST}
+
+function get_primary_address() {
+    local result=$(psql -h localhost -p 5433 -U {{ pgpool.user }} postgres -c 'show pool_nodes' | grep 'primary' | awk '{print $3}' | tail -1)
+    echo $result
+}
+
+## Test passwrodless SSH
+ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null postgres@${DEST_NODE_HOST} -i ~/.ssh/id_rsa_pgpool ls /tmp > /dev/null
+
+if [ $? -ne 0 ]; then
+    logger -i -p local1.error recovery_1st_stage: passwrodless SSH to postgres@${DEST_NODE_HOST} failed. Please setup passwrodless SSH.
+    exit 1
+fi
+
+## Get PostgreSQL major version
+PGVERSION=`${PGHOME}/initdb -V | awk '{print $3}' | sed 's/\..*//' | sed 's/\([0-9]*\)[a-zA-Z].*/\1/'`
+if [ $PGVERSION -ge 12 ]; then
+    RECOVERYCONF=${DEST_NODE_PGDATA}/myrecovery.conf
+else
+    RECOVERYCONF=${DEST_NODE_PGDATA}/recovery.conf
+fi
+
+## Execute pg_basebackup to recovery Standby node
+ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null postgres@$DEST_NODE_HOST -i ~/.ssh/id_rsa_pgpool "
+
+    set -o errexit
+
+    rm -rf $DEST_NODE_PGDATA
+    rm -rf $ARCHIVEDIR/*
+
+    ${PGHOME}/pg_basebackup -h $(get_primary_address) -U ${REPL_USER} -p ${PRIMARY_NODE_PORT} -D ${DEST_NODE_PGDATA} -X stream
+
+    if [ ${PGVERSION} -ge 12 ]; then
+        sed -i -e \"\\\$ainclude_if_exists = '$(echo ${RECOVERYCONF} | sed -e 's/\//\\\//g')'\" \
+               -e \"/^include_if_exists = '$(echo ${RECOVERYCONF} | sed -e 's/\//\\\//g')'/d\" ${DEST_NODE_PGDATA}/postgresql.conf
+    fi
+
+    cat > ${RECOVERYCONF} << EOT
+primary_conninfo = 'host=$(get_primary_address) port=${PRIMARY_NODE_PORT} user=${REPL_USER} passfile=''/var/lib/postgresql/.pgpass'''
+recovery_target_timeline = 'latest'
+restore_command = 'scp postgres@$(get_primary_address):${ARCHIVEDIR}/%f %p'
+EOT
+
+    if [ ${PGVERSION} -ge 12 ]; then
+        touch ${DEST_NODE_PGDATA}/standby.signal
+    else
+        echo \"standby_mode = 'on'\" >> ${RECOVERYCONF}
+    fi
+
+    sed -i \"s/#*port = .*/port = ${DEST_NODE_PORT}/\" {{ postgresql_conf_dir }}/postgresql.conf
+"
+
+if [ $? -ne 0 ]; then
+    logger -i -p local1.error recovery_1st_stage: end: pg_basebackup failed. online recovery failed
+    exit 1
+fi
+
+logger -i -p local1.info recovery_1st_stage: end: recovery_1st_stage complete
+exit 0

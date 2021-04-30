@@ -1,0 +1,13 @@
+# file: defaults/main.yml -- main variables
+
+postgresql_user_home: /var/lib/postgresql
+postgresql_data_dir: /var/lib/postgresql/{{ postgresql_version }}/main
+postgresql_archive_dir: /var/lib/postgresql/{{ postgresql_version }}/main/archive
+postgresql_conf_dir: /etc/postgresql/{{ postgresql_version }}/main
+postgresql_exec_dir: /usr/lib/postgresql/{{ postgresql_version }}/bin
+
+# Basic settings
+postgresql_version: 9.5
+
+# PostgreSQL users and roles
+postgresql_admin_user: "postgres"

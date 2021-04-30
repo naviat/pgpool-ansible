@@ -1,0 +1,219 @@
+- name: "Install pgpool2 packages"
+  apt:
+    name: ["postgresql-{{ postgresql_version }}-pgpool2", "pgpool2", "python-pip", "python-pexpect", "python-setuptools"]
+    state: present
+
+- name: "Disable the rot pool nodes status file"
+  lineinfile:
+    path: /lib/systemd/system/pgpool2.service
+    regexp: '^ExecStart='
+    line: ExecStart=/usr/sbin/pgpool -D -n -f /etc/pgpool2/pgpool.conf
+
+- name: "Suppress failed to bind a socket error by force delete socket file"
+  lineinfile:
+    path: /lib/systemd/system/pgpool2.service
+    insertafter: '^ExecStart='
+    line: ExecStop=/usr/sbin/pgpool -f /etc/pgpool2/pgpool.conf -m fast stop
+
+- name: "Reload systemctl daemon"
+  systemd:
+    daemon_reload: yes
+
+- name: "Copy template files to /etc/pgpool2"
+  template:
+    src: "{{ item }}"
+    dest: "/etc/pgpool2/{{ item }}"
+    owner: "{{ postgresql_admin_user }}"
+    group: "{{ postgresql_admin_user }}"
+    mode: u=rwx,g=rx,o=rx
+  with_items:
+    - failover.sh
+    - follow_master.sh
+    - pgpool.conf
+
+### pool_hba.conf
+- name: "Copy files to /etc/pgpool2/pool_hba.conf"
+  copy:
+    src: pool_hba.conf
+    dest: "/etc/pgpool2/pool_hba.conf"
+    owner: "{{ postgresql_admin_user }}"
+    group: "{{ postgresql_admin_user }}"
+
+### pcp.conf
+- name: "Check pcp.conf existence"
+  stat:
+    path: /etc/pgpool2/pcp.conf
+  register: pcp_conf_exists
+
+- name: "Create file pcp.conf if not exist"
+  file:
+    path: /etc/pgpool2/pcp.conf
+    state: touch
+    owner: "{{ postgresql_admin_user }}"
+    group: "{{ postgresql_admin_user }}"
+  when: not pcp_conf_exists.stat.exists
+
+- name: "Generate password of pgpool user"
+  command: "pg_md5 {{ pgpool.pass }}"
+  register: pgpool_user_md5_password
+
+- name: "Add a line in pcp.conf"
+  lineinfile:
+    path: /etc/pgpool2/pcp.conf
+    line: "{{ pgpool.user }}:{{ pgpool_user_md5_password.stdout }}"
+
+### pool_passwd
+- name: "Check pool_passwd existence"
+  stat:
+    path: /etc/pgpool2/pool_passwd
+  register: pool_passwd_conf_exists
+
+- name: "Create file pool_passwd if not exist"
+  file:
+    path: /etc/pgpool2/pool_passwd
+    state: touch
+    owner: "{{ postgresql_admin_user }}"
+    group: "{{ postgresql_admin_user }}"
+  when: not pool_passwd_conf_exists.stat.exists
+
+- name: "Add pool passwd for pgpool user"
+  expect:
+    command: "pg_md5 -m -f /etc/pgpool2/pgpool.conf -u {{ pgpool.user }} -p"
+    responses:
+      password: "{{ pgpool.pass }}"
+    echo: yes
+
+- name: "Add pool passwd for postgresql_admin user"
+  expect:
+    command: "pg_md5 -m -f /etc/pgpool2/pgpool.conf -u {{ postgresql_admin_user }} -p"
+    responses:
+      password: "{{ postgresql_admin_password }}"
+    echo: yes
+
+- name: "Add pool passwd for provisioning user"
+  expect:
+    command: "pg_md5 -m -f /etc/pgpool2/pgpool.conf -u {{ provisioning.user }} -p"
+    responses:
+      password: "{{ provisioning.password }}"
+    echo: yes
+
+### .pcppass
+
+- name: "Copy files to .pcppass"
+  template:
+    src: .pcppass
+    dest: "{{ postgresql_user_home }}/.pcppass"
+    owner: "{{ postgresql_admin_user }}"
+    group: "{{ postgresql_admin_user }}"
+    mode: '600'
+    force: yes
+
+- name: "Copy files to {{ postgresql_data_dir }}"
+  template:
+    src: "{{ item }}"
+    dest: "{{ postgresql_data_dir }}/{{ item }}"
+    owner: "{{ postgresql_admin_user }}"
+    group: "{{ postgresql_admin_user }}"
+    mode: u=rwx,g=rx,o=rx
+  with_items:
+    - recovery_1st_stage
+    - pgpool_remote_start
+
+- name: "Add lines in pg_hba.conf"
+  lineinfile:
+    path: "{{ postgresql_conf_dir }}/pg_hba.conf"
+    line: "{{ item }}"
+  with_items:
+    - "host    all         {{ pgpool.user }}           0.0.0.0/0          md5"
+    - "host    all         {{ postgresql_admin_user }}         0.0.0.0/0          md5"
+
+- name: "Create recovery extension"
+  command: "sudo -u {{ postgresql_admin_user }} psql template1 -c \"CREATE EXTENSION IF NOT EXISTS pgpool_recovery\""
+  when: "'master' in group_names"
+
+- name: "Add pgpool2 role"
+  postgresql_user:
+    state: present
+    name: "{{ pgpool.user }}"
+    encrypted: yes
+    password: "{{ pgpool.pass }}"
+    role_attr_flags: LOGIN
+  when: "'master' in group_names"
+
+- name: "Set postgres password"
+  postgresql_user:
+    state: present
+    name: "{{ postgresql_admin_user }}"
+    encrypted: yes
+    password: "{{ postgresql_admin_password }}"
+  when: "'master' in group_names"
+
+- name: "Allow postgres user can restart postgresql service / in case of recovering"
+  lineinfile:
+    path: /etc/sudoers
+    line: "postgres ALL = NOPASSWD: /bin/systemctl restart postgresql.service"
+
+- name: "Check /var/log/pgpool2/ existence"
+  stat:
+    path: /var/log/pgpool2
+  register: pool_parent_log_file_exists
+
+- name: "Create /var/log/pgpool2 directory if not exist"
+  file:
+    path: /var/log/pgpool2
+    state: directory
+  when: not pool_parent_log_file_exists.stat.exists
+
+- name: "Check pgpool.log existence"
+  stat:
+    path: /var/log/pgpool2/pgpool.log
+  register: pool_log_file_exists
+
+- name: "Create pgpool log file if not exist"
+  file:
+    path: /var/log/pgpool2/pgpool.log
+    state: touch
+    mode: '777'
+  when: not pool_log_file_exists.stat.exists
+
+- name: "route pgpool log to a log file"
+  lineinfile:
+    path: /etc/rsyslog.conf
+    line: "LOCAL1.*                                                /var/log/pgpool2/pgpool.log"
+
+- name: "Add rotation configuration of pgpool log file"
+  lineinfile:
+    path: /etc/logrotate.d/rsyslog
+    insertafter: "/var/log/messages"
+    line: "/var/log/pgpool2/pgpool.log"
+
+- name: "Restart rsyslog"
+  service:
+    name: rsyslog
+    state: restarted
+
+- name: "restart postgresql"
+  service:
+    name: postgresql
+    state: restarted
+
+- name: "Stop pgpool"
+  service:
+    name: pgpool2
+    state: stopped
+
+- name: "Start pgpool at master first"
+  service:
+    name: pgpool2
+    state: started
+  when: "'master' in group_names"
+
+- name: "Pausing for a moment to let the watchdog on master promote it self become the leader"
+  pause:
+    seconds: 5
+
+- name: "Start pgpool at slaves"
+  service:
+    name: pgpool2
+    state: started
+  when: "'slave' in group_names"

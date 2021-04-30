@@ -1,0 +1,15 @@
+galaxy_info:
+  author: Tran Tien Duc
+  description: Simple ansible pgpool installation on master/slave setup
+  company: Linagora Vietnam
+
+  min_ansible_version: 2.4
+  platforms:
+    - name: Debian
+      versions:
+        - stretch
+
+  galaxy_tags: []
+
+dependencies: []
+  
